@@ -1,5 +1,11 @@
-#define STASSID "FiWii-SSID"
+// Если кому в друг окажется полезным, оставляю ссылки на статьи которые читал при написании:
+// https://randomnerdtutorials.com/esp32-ds18b20-temperature-arduino-ide/
+// https://randomnerdtutorials.com/esp32-esp8266-web-server-http-authentication/
+// https://alexgyver.ru/gyverpid/
+// 
+// By SVSD_VAL
 
+#define STASSID "FiWii-SSID"
 #define STAPSK  "Enter-YOUR-PASSSWORD-HERE"
 
 #ifdef ESP32
@@ -263,22 +269,51 @@ setInterval(update, 1000) ;
 )rawliteral";
 
 
-String temperatureC = "";
+const char* http_username = "admin";
+const char* http_password = "admin123";
 
-// Timer variables
-unsigned long lastTime = 0;  
-unsigned long timerDelay = 2000;
+String temperatureC = "";
 
 // Replace with your network credentials
 const char* ssid = STASSID;
 const char* password = STAPSK;
 
-// Create AsyncWebServer object on port 80
-AsyncWebServer server(80);
+short cur_state = 0;
 
-const int output5 = LED_BUILTIN;
+uint64_t work_time = 0;
+unsigned long target_worktime=0;
 
-// функция пид
+unsigned long restart_cnt = 0;
+
+float cur_temp = 0.0f;
+float max_temp=16.1f;
+float min_temp=10.0f;
+float target_temp=15.3f;
+
+String last_date = "...";
+
+int cur_pwm=0;
+// Timer variables
+unsigned long last_sensor_time = 0;  
+unsigned long last_halt_time = 0;
+unsigned long last_pid_time = 0;
+// Время (мс) которе должно пройти после сбоя (cur_state = -1 ) что бы попытаться запустить повторно
+#define restart_delay 600000
+// Интервал (мс) считывания показания с датчика температуры
+#define sensor_timer_delay 2000
+// Интервал (мс) обработки PID'a 
+#define pid_timer_delay 200
+// Светодиод отображения рабочего состояния.
+#define LED LED_BUILTIN
+// Пин состояния работы
+#define power_pin D8
+// Пин ШИМ'а
+#define pwm_pin 5
+// Стандартный порт http сервера
+#define http_port 80
+
+AsyncWebServer server(http_port);
+
 int computePID(float input, float setpoint, float kp, float ki, float kd, float dt, int minOut, int maxOut) {
   float err = setpoint - input;
   static float integral = 0, prevErr = 0;
@@ -288,39 +323,17 @@ int computePID(float input, float setpoint, float kp, float ki, float kd, float 
   return constrain(err * kp + integral + D * kd, minOut, maxOut);
 }
 float readDSTemperatureC() {
-  // Call sensors.requestTemperatures() to issue a global temperature and Requests to all devices on the bus
   sensors.requestTemperatures(); 
   float tempC = sensors.getTempCByIndex(0);
-
   if(tempC == -127.00) {
-    Serial.println("Failed to read from DS18B20 sensor");
-    return -127.00;
-  } else {
-    Serial.print("Temperature Celsius: ");
-    Serial.println(tempC); 
-    Serial.print("LED_BUILTIN: ");
-    Serial.println(LED_BUILTIN); 
+    Serial.println("!!Failed to read from DS18B20 sensor!!");
   }
+  Serial.print("Temperature Celsius: ");
+  Serial.println(tempC); 
   return tempC;
 }
 
-short cur_state = 0;
-uint64_t work_time = 0;
-unsigned long restart_cnt = 0;
-float cur_temp = 0.0f;
-String last_date = "...";
-float max_temp=16.1f;
-float min_temp=10.0f;
-float target_temp=15.3f;
-unsigned long target_worktime=0;
-int cur_pwm=0;
-
-
-#define restart_delay 10000
-
-unsigned long last_halt_time=0;
-unsigned long last_pid_time=0;
-unsigned int pidDelay=200;
+// Формат строки возврата текущего состояния.
 
 String formatJson(){
   char s[350];
@@ -334,14 +347,13 @@ String formatJson(){
   return String(s);
 }
 
-#define LED LED_BUILTIN
-#define power_pin D8
 
 Ticker blinker;
 
 void onTimer(){
 if ( cur_state ){
     digitalWrite(LED, !digitalRead(LED));
+    // Добавляем 1 секунду к работе
     work_time+=1;
   }
 }
@@ -350,14 +362,16 @@ void wshutdown(int state=0){
   Serial.println("shutdown");
   cur_state= state;
   cur_pwm=0;
-  analogWrite(5, cur_pwm);
+  analogWrite(pwm_pin, cur_pwm);
   digitalWrite(LED, 1);  
 }
+
 void wstartup(){
   cur_state   = 1;
   restart_cnt = 0;
-  cur_pwm=0;
-  analogWrite(5, cur_pwm);
+  cur_pwm = 0;
+  work_time = 0;
+  analogWrite(pwm_pin, cur_pwm);
   digitalWrite(LED, 0);
   
 }
@@ -367,15 +381,13 @@ void setup(){
   Serial.begin(115200);
   Serial.println();
   pinMode(power_pin  , OUTPUT);
-  pinMode(5   , OUTPUT);
-  pinMode(LED , OUTPUT);
-  digitalWrite(LED, 1);
+  pinMode(pwm_pin    , OUTPUT);
+  pinMode(LED        , OUTPUT);
+  digitalWrite(LED   , 1);
   
   // Start up the DS18B20 library
   sensors.begin();
-
   cur_temp = readDSTemperatureC();
-  //temperatureF = readDSTemperatureF();
 
   // Connect to Wi-Fi
   WiFi.begin(ssid, password);
@@ -401,6 +413,15 @@ void setup(){
   });
 
   server.on("/apply", HTTP_POST, [](AsyncWebServerRequest *request){
+    if(!request->authenticate(http_username, http_password))
+    {
+      Serial.print("request Authentication != Login:");
+      Serial.print(http_username);
+      Serial.print(" password:");
+      Serial.print(http_password);
+      return request->requestAuthentication();
+    }
+          
     int paramsNr = request->params();
     Serial.println(paramsNr);
     int ishalt=0;
@@ -409,6 +430,7 @@ void setup(){
         if ( p->name() == "btn-stop" ){
           wshutdown(0);
           ishalt=1;
+          Serial.println('!Stop');
         }
     }
 
@@ -417,9 +439,9 @@ void setup(){
       for(int i=0;i<paramsNr;i++){
         AsyncWebParameter* p = request->getParam(i);
         Serial.print(p->name());
-        Serial.print("=");
+        Serial.print("->");
         Serial.println(p->value());
-        Serial.println("------");
+        Serial.println();
         
         if ( p->name() == "itarget_worktime" ){
           Serial.print("setup target_worktime = ");
@@ -464,16 +486,13 @@ void setup(){
     for(int i=0;i<paramsNr;i++){
  
         AsyncWebParameter* p = request->getParam(i);
-        Serial.print("Param name: ");
-        Serial.println(p->name());
-        Serial.print("Param value: ");
+        Serial.print(p->name());
+        Serial.print("->");
         Serial.println(p->value());
-
+        Serial.println();
         Serial.print("int value: ");
         int x = p->value().toInt();
         Serial.println(x);
-
-        Serial.println("------");
 
         pinMode(x, OUTPUT);  
         if ( p->name() == "pin_on" ){
@@ -484,11 +503,6 @@ void setup(){
          Serial.print("set pin off");
          digitalWrite( x , LOW);
         };
-        if ( p->name() == "blink" ){
-         Serial.println("blink");
- //        blink();
-        };
-
     }
     
     //request->send_P(200, "text/plain", "OK");
@@ -504,20 +518,21 @@ void setup(){
  
 void loop(){
   // Получение температуры
-  if ( millis() > lastTime ) {
+  if ( millis() > last_sensor_time ) {
     cur_temp = readDSTemperatureC();
     temperatureC = String(cur_temp);
-    lastTime = millis() + timerDelay;
+    last_sensor_time = millis() + sensor_timer_delay;
   }
   // Расчёт PID
   if ( millis() > last_pid_time ) {
     if ( cur_state == 1 ) {
       unsigned long pidTime= millis() - last_pid_time;
       cur_pwm = computePID(  cur_temp , target_temp , 1.0, 2.0, 3.0, pidTime * 0.01f , 0, 1024 ) ;
-      analogWrite(5, cur_pwm);
+      analogWrite(pwm_pin , cur_pwm);
     }
-    last_pid_time = millis() + pidDelay;
+    last_pid_time = millis() + pid_timer_delay;
   }
+  
   if ( cur_state == 1 )
   {
     // Проверка на минимальную температуру
@@ -543,6 +558,11 @@ void loop(){
     
   }
   // Указание текущего состояния пина работы.
-  digitalWrite(power_pin, cur_state);
+  if ( cur_state == 1 ){
+     digitalWrite(power_pin, 1);
+  } else
+  {
+     digitalWrite(power_pin, 0);
+  }
   
 }
