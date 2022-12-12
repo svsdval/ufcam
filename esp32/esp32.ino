@@ -527,7 +527,7 @@ void loop(){
   if ( millis() > last_pid_time ) {
     if ( cur_state == 1 ) {
       unsigned long pidTime= millis() - last_pid_time;
-      cur_pwm = computePID(  cur_temp , target_temp , 1.0, 2.0, 3.0, pidTime * 0.01f , 0, 1024 ) ;
+      cur_pwm = computePID(  cur_temp , target_temp , 1.0, 2.0, 3.0, pidTime * 0.01f , 0, 255 ) ;
       analogWrite(pwm_pin , cur_pwm);
     }
     last_pid_time = millis() + pid_timer_delay;
